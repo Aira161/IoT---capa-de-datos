@@ -564,6 +564,65 @@ def get_map_json(request, **kwargs):
     return JsonResponse(data_result)
 
 
+# Implementación de la consulta para contar el número de muestras por estación en un rango de fechas específico.
+
+@csrf_exempt
+def get_station_ranking(request):
+
+    try:
+        start = datetime.fromtimestamp(
+            float(request.GET.get("from", None)) / 1000
+        )
+    except:
+        start = None
+
+    try:
+        end = datetime.fromtimestamp(
+            float(request.GET.get("to", None)) / 1000
+        )
+    except:
+        end = None
+
+    if not start and not end:
+        start = datetime.now() - dateutil.relativedelta.relativedelta(weeks=1)
+        end = datetime.now()
+    elif not end:
+        end = datetime.now()
+    elif not start:
+        start = datetime.fromtimestamp(0)
+
+    start_ts = int(start.timestamp() * 1000000)
+    end_ts = int(end.timestamp() * 1000000)
+
+    ranking_qs = (
+        Data.objects
+        .filter(time__gte=start_ts, time__lte=end_ts)
+        .values(
+            "station__id",
+            "station__location__city__name"
+        )
+        .annotate(total_samples=Sum("length"))
+        .order_by("-total_samples")
+    )
+
+    ranking = [
+        {
+            "station_id": item["station__id"],
+            "station": item["station__location__city__name"],
+            "total_samples": item["total_samples"] or 0
+        }
+        for item in ranking_qs
+    ]
+
+    response = {
+        "start": start.strftime("%d/%m/%Y"),
+        "end": end.strftime("%d/%m/%Y"),
+        "ranking": ranking
+    }
+
+    return JsonResponse(response)
+
+
 class RemaView(TemplateView):
     template_name = "rema.html"
 
