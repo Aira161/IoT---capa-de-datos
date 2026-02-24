@@ -38,7 +38,8 @@ from .models import (
 )
 from realtimeMonitoring import settings
 import dateutil.relativedelta
-from django.db.models import Avg, Max, Min, Sum
+from django.db.models import Avg, Max, Min, Sum, Count
+from django.db import connection
 
 
 class DashboardView(TemplateView):
@@ -564,65 +565,6 @@ def get_map_json(request, **kwargs):
     return JsonResponse(data_result)
 
 
-# Implementación de la consulta para contar el número de muestras por estación en un rango de fechas específico.
-
-@csrf_exempt
-def get_station_ranking(request):
-
-    try:
-        start = datetime.fromtimestamp(
-            float(request.GET.get("from", None)) / 1000
-        )
-    except:
-        start = None
-
-    try:
-        end = datetime.fromtimestamp(
-            float(request.GET.get("to", None)) / 1000
-        )
-    except:
-        end = None
-
-    if not start and not end:
-        start = datetime.now() - dateutil.relativedelta.relativedelta(weeks=1)
-        end = datetime.now()
-    elif not end:
-        end = datetime.now()
-    elif not start:
-        start = datetime.fromtimestamp(0)
-
-    start_ts = int(start.timestamp() * 1000000)
-    end_ts = int(end.timestamp() * 1000000)
-
-    ranking_qs = (
-        Data.objects
-        .filter(time__gte=start_ts, time__lte=end_ts)
-        .values(
-            "station__id",
-            "station__location__city__name"
-        )
-        .annotate(total_samples=Sum("length"))
-        .order_by("-total_samples")
-    )
-
-    ranking = [
-        {
-            "station_id": item["station__id"],
-            "station": item["station__location__city__name"],
-            "total_samples": item["total_samples"] or 0
-        }
-        for item in ranking_qs
-    ]
-
-    response = {
-        "start": start.strftime("%d/%m/%Y"),
-        "end": end.strftime("%d/%m/%Y"),
-        "ranking": ranking
-    }
-
-    return JsonResponse(response)
-
-
 class RemaView(TemplateView):
     template_name = "rema.html"
 
@@ -804,6 +746,190 @@ def get_daterange(request):
         start = datetime.fromtimestamp(0)
 
     return start, end
+
+
+"""
+Endpoint API: Estadísticas horarias por medición y ubicación.
+Retorna JSON con agregaciones (avg, min, max, count) agrupadas por hora,
+por estación y ubicación, para un tipo de medición en un rango de tiempo.
+
+URL: /api/stats/hourly/<measurement_name>/?from=<timestamp_ms>&to=<timestamp_ms>
+
+Esta versión usa time_bucket('1 hour', time) de TimescaleDB,
+optimizado para hypertables con chunks temporales.
+"""
+
+
+@csrf_exempt
+def hourly_stats_by_location(request, measurement_name=None):
+    if request.method != 'GET':
+        return HttpResponseBadRequest(json.dumps({'error': 'Solo se permite GET'}), content_type='application/json')
+
+    result = {
+        'measurement': None,
+        'time_range': {},
+        'locations': [],
+        'total_records': 0,
+        'query_time_ms': 0,
+    }
+
+    start_time = time.time()
+
+    try:
+        # Obtener la medición
+        measurements = Measurement.objects.all()
+        selected_measurement = None
+
+        if measurement_name:
+            selected_measurement = Measurement.objects.filter(name=measurement_name).first()
+        if not selected_measurement and measurements.count() > 0:
+            selected_measurement = measurements.first()
+
+        if not selected_measurement:
+            return JsonResponse({'error': 'No se encontró la medición especificada'}, status=404)
+
+        result['measurement'] = {
+            'name': selected_measurement.name,
+            'unit': selected_measurement.unit,
+        }
+
+        # Parsear rango de tiempo
+        try:
+            start = datetime.fromtimestamp(float(request.GET.get('from', None)) / 1000)
+        except:
+            start = None
+        try:
+            end = datetime.fromtimestamp(float(request.GET.get('to', None)) / 1000)
+        except:
+            end = None
+
+        # Si no se especifica rango, consultar todo el rango de datos disponible
+        if start is None and end is None:
+            time_range = Data.objects.aggregate(
+                min_time=Min('base_time'),
+                max_time=Max('base_time'),
+            )
+            if time_range['min_time'] and time_range['max_time']:
+                start = time_range['min_time']
+                end = time_range['max_time'] + dateutil.relativedelta.relativedelta(days=1)
+            else:
+                start = datetime.fromtimestamp(0)
+                end = datetime.now()
+        elif end is None:
+            end = datetime.now()
+        elif start is None:
+            start = datetime.fromtimestamp(0)
+
+        result['time_range'] = {
+            'from': start.strftime('%Y-%m-%d %H:%M:%S'),
+            'to': end.strftime('%Y-%m-%d %H:%M:%S'),
+        }
+
+        # Consulta con time_bucket de TimescaleDB
+        # Usa base_time (DateTimeField/timestamptz) para time_bucket,
+        # ya que el campo "time" es BigIntegerField (microsegundos).
+        # Los nombres de tabla van entre comillas dobles porque Django
+        # los crea con mayúsculas/minúsculas mixtas (case-sensitive).
+        raw_sql = """
+            SELECT
+                time_bucket('1 hour', d.base_time) AS hour,
+                s.id AS station_id,
+                u.login AS user_login,
+                ci.name AS city_name,
+                st.name AS state_name,
+                co.name AS country_name,
+                l.lat AS lat,
+                l.lng AS lng,
+                AVG(d.avg_value) AS avg_value,
+                MIN(d.min_value) AS min_value,
+                MAX(d.max_value) AS max_value,
+                SUM(d.length) AS count
+            FROM "realtimeGraph_data" d
+            INNER JOIN "realtimeGraph_station" s ON d.station_id = s.id
+            INNER JOIN "realtimeGraph_user" u ON s.user_id = u.login
+            INNER JOIN "realtimeGraph_location" l ON s.location_id = l.id
+            INNER JOIN "realtimeGraph_city" ci ON l.city_id = ci.id
+            INNER JOIN "realtimeGraph_state" st ON l.state_id = st.id
+            INNER JOIN "realtimeGraph_country" co ON l.country_id = co.id
+            WHERE d.measurement_id = %s
+              AND d.base_time >= %s
+              AND d.base_time <= %s
+            GROUP BY hour, s.id, u.login, ci.name, st.name, co.name, l.lat, l.lng
+            ORDER BY hour;
+        """
+
+        with connection.cursor() as cursor:
+            cursor.execute(raw_sql, [selected_measurement.id, start, end])
+            columns = [col[0] for col in cursor.description]
+            rows = cursor.fetchall()
+
+        # Agrupar resultados por ubicación
+        locations_dict = {}
+        total_records = 0
+
+        for row in rows:
+            entry = dict(zip(columns, row))
+            city = entry['city_name'] or 'N/A'
+            state = entry['state_name'] or 'N/A'
+            country = entry['country_name'] or 'N/A'
+            location_key = f"{city}, {state}, {country}"
+
+            if location_key not in locations_dict:
+                locations_dict[location_key] = {
+                    'location': location_key,
+                    'lat': float(entry['lat']) if entry['lat'] else None,
+                    'lng': float(entry['lng']) if entry['lng'] else None,
+                    'user': entry['user_login'],
+                    'station_id': entry['station_id'],
+                    'hourly_stats': [],
+                    'summary': {
+                        'total_count': 0,
+                        'global_min': None,
+                        'global_max': None,
+                        'avg_of_avgs': 0,
+                    },
+                }
+
+            loc = locations_dict[location_key]
+            hour_str = entry['hour'].strftime('%Y-%m-%d %H:%M:%S') if entry['hour'] else None
+
+            loc['hourly_stats'].append({
+                'hour': hour_str,
+                'avg': round(float(entry['avg_value']), 2) if entry['avg_value'] else 0,
+                'min': round(float(entry['min_value']), 2) if entry['min_value'] else 0,
+                'max': round(float(entry['max_value']), 2) if entry['max_value'] else 0,
+                'count': entry['count'],
+            })
+
+            total_records += entry['count']
+
+            # Actualizar resumen global
+            min_val = float(entry['min_value']) if entry['min_value'] else 0
+            max_val = float(entry['max_value']) if entry['max_value'] else 0
+            if loc['summary']['global_min'] is None or min_val < loc['summary']['global_min']:
+                loc['summary']['global_min'] = round(min_val, 2)
+            if loc['summary']['global_max'] is None or max_val > loc['summary']['global_max']:
+                loc['summary']['global_max'] = round(max_val, 2)
+            loc['summary']['total_count'] += entry['count']
+
+        # Calcular promedio de promedios por ubicación
+        for loc_key in locations_dict:
+            loc = locations_dict[loc_key]
+            if len(loc['hourly_stats']) > 0:
+                sum_avgs = sum(h['avg'] for h in loc['hourly_stats'])
+                loc['summary']['avg_of_avgs'] = round(sum_avgs / len(loc['hourly_stats']), 2)
+
+        result['locations'] = list(locations_dict.values())
+        result['total_records'] = total_records
+
+    except Exception as e:
+        result['error'] = str(e)
+        print('Error en hourly_stats_by_location:', e)
+
+    end_time = time.time()
+    result['query_time_ms'] = round((end_time - start_time) * 1000, 2)
+
+    return JsonResponse(result, safe=False)
 
 
 """
