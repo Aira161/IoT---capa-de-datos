@@ -3,7 +3,6 @@ import json
 from os import name
 import time
 
-from django.db.models.aggregates import Count
 from realtimeMonitoring.utils import getCityCoordinates
 from typing import Dict
 import requests
@@ -23,7 +22,8 @@ from random import randint
 from .models import City, Country, Data, Location, Measurement, Role, State, Station, User
 from realtimeMonitoring import settings
 import dateutil.relativedelta
-from django.db.models import Avg, Max, Min, Sum
+from django.db.models import Avg, Max, Min, Sum, Count
+from django.db.models.functions import TruncHour
 
 
 class DashboardView(TemplateView):
@@ -648,6 +648,178 @@ def get_daterange(request):
         start = datetime.fromtimestamp(0)
 
     return start, end
+
+
+'''
+Endpoint API: Estadísticas horarias por medición y ubicación.
+Retorna JSON con agregaciones (avg, min, max, count) agrupadas por hora,
+por estación y ubicación, para un tipo de medición en un rango de tiempo.
+
+URL: /api/stats/hourly/<measurement_name>/?from=<timestamp_ms>&to=<timestamp_ms>
+
+Este endpoint es clave para comparar rendimiento PostgreSQL vs TimescaleDB:
+- PostgreSQL usa DATE_TRUNC('hour', time) internamente via TruncHour de Django
+- TimescaleDB usaría time_bucket('1 hour', time) optimizado para hypertables
+'''
+
+
+@csrf_exempt
+def hourly_stats_by_location(request, measurement_name=None):
+    if request.method != 'GET':
+        return HttpResponseBadRequest(json.dumps({'error': 'Solo se permite GET'}), content_type='application/json')
+
+    result = {
+        'measurement': None,
+        'time_range': {},
+        'locations': [],
+        'total_records': 0,
+        'query_time_ms': 0,
+    }
+
+    start_time = time.time()
+
+    try:
+        # Obtener la medición
+        measurements = Measurement.objects.all()
+        selected_measurement = None
+
+        if measurement_name:
+            selected_measurement = Measurement.objects.filter(name=measurement_name).first()
+        if not selected_measurement and measurements.count() > 0:
+            selected_measurement = measurements.first()
+
+        if not selected_measurement:
+            return JsonResponse({'error': 'No se encontró la medición especificada'}, status=404)
+
+        result['measurement'] = {
+            'name': selected_measurement.name,
+            'unit': selected_measurement.unit,
+        }
+
+        # Parsear rango de tiempo
+        try:
+            start = datetime.fromtimestamp(float(request.GET.get('from', None)) / 1000)
+        except:
+            start = None
+        try:
+            end = datetime.fromtimestamp(float(request.GET.get('to', None)) / 1000)
+        except:
+            end = None
+
+        # Si no se especifica rango, consultar todo el rango de datos disponible
+        if start is None and end is None:
+            time_range = Data.objects.aggregate(
+                min_time=Min('time'),
+                max_time=Max('time'),
+            )
+            if time_range['min_time'] and time_range['max_time']:
+                start = time_range['min_time']
+                end = time_range['max_time'] + dateutil.relativedelta.relativedelta(days=1)
+            else:
+                start = datetime.fromtimestamp(0)
+                end = datetime.now()
+        elif end is None:
+            end = datetime.now()
+        elif start is None:
+            start = datetime.fromtimestamp(0)
+
+        result['time_range'] = {
+            'from': start.strftime('%Y-%m-%d %H:%M:%S'),
+            'to': end.strftime('%Y-%m-%d %H:%M:%S'),
+        }
+
+        # Consulta principal: agregar por hora y por estación/ubicación
+        # Para PostgreSQL, TruncHour usa DATE_TRUNC('hour', time)
+        hourly_data = (
+            Data.objects.filter(
+                measurement=selected_measurement,
+                time__gte=start,
+                time__lte=end,
+            )
+            .annotate(hour=TruncHour('time'))
+            .values(
+                'hour',
+                'station__id',
+                'station__user__login',
+                'station__location__city__name',
+                'station__location__state__name',
+                'station__location__country__name',
+                'station__location__lat',
+                'station__location__lng',
+            )
+            .annotate(
+                avg_value=Avg('value'),
+                min_value=Min('value'),
+                max_value=Max('value'),
+                count=Count('value'),
+            )
+            .order_by('hour')
+        )
+
+        # Agrupar resultados por ubicación
+        locations_dict = {}
+        total_records = 0
+
+        for entry in hourly_data:
+            city = entry['station__location__city__name'] or 'N/A'
+            state = entry['station__location__state__name'] or 'N/A'
+            country = entry['station__location__country__name'] or 'N/A'
+            location_key = f"{city}, {state}, {country}"
+
+            if location_key not in locations_dict:
+                locations_dict[location_key] = {
+                    'location': location_key,
+                    'lat': float(entry['station__location__lat']) if entry['station__location__lat'] else None,
+                    'lng': float(entry['station__location__lng']) if entry['station__location__lng'] else None,
+                    'user': entry['station__user__login'],
+                    'station_id': entry['station__id'],
+                    'hourly_stats': [],
+                    'summary': {
+                        'total_count': 0,
+                        'global_min': None,
+                        'global_max': None,
+                        'avg_of_avgs': 0,
+                    },
+                }
+
+            loc = locations_dict[location_key]
+            hour_str = entry['hour'].strftime('%Y-%m-%d %H:%M:%S') if entry['hour'] else None
+
+            loc['hourly_stats'].append({
+                'hour': hour_str,
+                'avg': round(entry['avg_value'], 2) if entry['avg_value'] else 0,
+                'min': round(entry['min_value'], 2) if entry['min_value'] else 0,
+                'max': round(entry['max_value'], 2) if entry['max_value'] else 0,
+                'count': entry['count'],
+            })
+
+            total_records += entry['count']
+
+            # Actualizar resumen global
+            if loc['summary']['global_min'] is None or entry['min_value'] < loc['summary']['global_min']:
+                loc['summary']['global_min'] = round(entry['min_value'], 2)
+            if loc['summary']['global_max'] is None or entry['max_value'] > loc['summary']['global_max']:
+                loc['summary']['global_max'] = round(entry['max_value'], 2)
+            loc['summary']['total_count'] += entry['count']
+
+        # Calcular promedio de promedios por ubicación
+        for loc_key in locations_dict:
+            loc = locations_dict[loc_key]
+            if len(loc['hourly_stats']) > 0:
+                sum_avgs = sum(h['avg'] for h in loc['hourly_stats'])
+                loc['summary']['avg_of_avgs'] = round(sum_avgs / len(loc['hourly_stats']), 2)
+
+        result['locations'] = list(locations_dict.values())
+        result['total_records'] = total_records
+
+    except Exception as e:
+        result['error'] = str(e)
+        print('Error en hourly_stats_by_location:', e)
+
+    end_time = time.time()
+    result['query_time_ms'] = round((end_time - start_time) * 1000, 2)
+
+    return JsonResponse(result, safe=False)
 
 
 '''

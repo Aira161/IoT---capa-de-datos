@@ -14,4 +14,7 @@ urlpatterns = [
     path('logout/', LogoutView.as_view(), name='logout'),
     path('historical/data',
          download_csv_data, name='historical-data'),
+    # Nuevo endpoint: Estadísticas horarias por medición y ubicación
+    path('api/stats/hourly/', hourly_stats_by_location, name='hourly-stats'),
+    path('api/stats/hourly/<str:measurement_name>/', hourly_stats_by_location, name='hourly-stats-measure'),
 ]
